@@ -24,12 +24,16 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <memory>
+
 #include "triton/backend/backend_common.h"
 #include "triton/backend/backend_input_collector.h"
 #include "triton/backend/backend_model.h"
 #include "triton/backend/backend_model_instance.h"
 #include "triton/backend/backend_output_responder.h"
 #include "triton/core/tritonbackend.h"
+
+#include "ctranslate2/models/model.h"
 
 namespace triton { namespace backend { namespace ctranslate2 {
 
@@ -61,15 +65,52 @@ class ModelState : public BackendModel {
       TRITONBACKEND_Model* triton_model, ModelState** state);
   virtual ~ModelState() = default;
 
-  ModelState(TRITONBACKEND_Model* triton_model)
-    : BackendModel(triton_model, false) {
+    ModelState(TRITONBACKEND_Model* triton_model)
+      : BackendModel(triton_model, false) {
+      THROW_IF_BACKEND_MODEL_ERROR(ValidateModel());
+    }
 
-  }
+    TRITONSERVER_Error* LoadModel(const ::ctranslate2::Device device, std::int32_t device_index, std::shared_ptr<const ::ctranslate2::models::Model>* ct_model) {
+      std::shared_ptr<const ::ctranslate2::models::Model> model;
+      if (models_.empty()) {
+        model = ::ctranslate2::models::Model::load(*model_reader_, device, device_index);
+        // TODO allow to specify COMPUTE_TYPE
+      } else {
+        model = models_.back()->copy_to(device, device_index);
+      }
+      models_.emplace_back(model);
+      *ct_model = model;
 
+      return nullptr;
+    }
 
  private:
   TRITONBACKEND_Model* triton_model_;
   triton::common::TritonJson::Value model_config_;
+  std::string model_path_;
+  std::shared_ptr<::ctranslate2::models::ModelReader> model_reader_;
+  std::vector<std::shared_ptr<const ::ctranslate2::models::Model>> models_;
+
+  TRITONSERVER_Error* ValidateModel() {
+      std::string artifact_filename;
+      THROW_IF_BACKEND_MODEL_ERROR(ModelConfig().MemberAsString(
+      "default_model_filename", &artifact_filename));
+      // if default_model_filename not set default to "model"
+      if (artifact_filename.empty()) {
+        artifact_filename = "model";
+      }
+
+      model_path_ = JoinPath({RepositoryPath(), std::to_string(Version()), artifact_filename});
+      model_reader_ = std::make_shared<::ctranslate2::models::ModelFileReader>(model_path_);
+      auto contains_model = ::ctranslate2::models::contains_model(model_path_);
+
+      RETURN_ERROR_IF_FALSE(
+        contains_model, TRITONSERVER_ERROR_UNAVAILABLE,
+        std::string("unable to find '") + model_path_ +
+            "' for model instance '" + Name() + "'");
+
+      return nullptr;
+  }
 
 };
 
@@ -174,118 +215,41 @@ class ModelInstanceState : public BackendModelInstance {
   // Get the state of the model that corresponds to this instance.
   ModelState* StateForModel() const { return model_state_; }
 
- private:
   ModelInstanceState(
       ModelState* model_state,
       TRITONBACKEND_ModelInstance* triton_model_instance)
       : BackendModelInstance(model_state, triton_model_instance),
         model_state_(model_state)
   {
+      if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+      #ifdef TRITON_ENABLE_GPU
+        device_ = ::ctranslate2::Device::CUDA;
+
+        // Need to set the CUDA context so that the context that events are
+        // created on match with contexts that events are recorded with.
+        THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
+            cudaSetDevice(DeviceId()), TRITONSERVER_ERROR_INTERNAL,
+            "Failed to set the device"));
+        THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
+            cudaEventCreate(&compute_input_start_event_),
+            TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
+        THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
+            cudaEventCreate(&compute_infer_start_event_),
+            TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
+        THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
+            cudaEventCreate(&compute_output_start_event_),
+            TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
+      #else
+        throw triton::backend::BackendModelInstanceException(TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_NOT_FOUND, "Backend not built with GPU support"));
+      #endif
+      } else {
+        device_ = ::ctranslate2::Device::CPU;
+      }
+      model_state->LoadModel(device_, DeviceId(), &model_);
   }
 
-  ModelState* model_state_;
-};
-
-TRITONSERVER_Error*
-ModelInstanceState::Create(
-    ModelState* model_state, TRITONBACKEND_ModelInstance* triton_model_instance,
-    ModelInstanceState** state)
-{
-  try {
-    *state = new ModelInstanceState(model_state, triton_model_instance);
-  }
-  catch (const BackendModelInstanceException& ex) {
-    RETURN_ERROR_IF_TRUE(
-        ex.err_ == nullptr, TRITONSERVER_ERROR_INTERNAL,
-        std::string("unexpected nullptr in BackendModelInstanceException"));
-    RETURN_IF_ERROR(ex.err_);
-  }
-
-  return nullptr;  // success
-}
-
-extern "C" {
-
-// Triton calls TRITONBACKEND_ModelInstanceInitialize when a model
-// instance is created to allow the backend to initialize any state
-// associated with the instance.
-//
-TRITONSERVER_Error*
-TRITONBACKEND_ModelInstanceInitialize(TRITONBACKEND_ModelInstance* instance)
-{
-  // Get the model state associated with this instance's model.
-  TRITONBACKEND_Model* model;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceModel(instance, &model));
-
-  void* vmodelstate;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelState(model, &vmodelstate));
-  ModelState* model_state = reinterpret_cast<ModelState*>(vmodelstate);
-
-  // Create a ModelInstanceState object and associate it with the
-  // TRITONBACKEND_ModelInstance.
-  ModelInstanceState* instance_state;
-  RETURN_IF_ERROR(
-      ModelInstanceState::Create(model_state, instance, &instance_state));
-  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceSetState(
-      instance, reinterpret_cast<void*>(instance_state)));
-
-  return nullptr;  // success
-}
-
-// Triton calls TRITONBACKEND_ModelInstanceFinalize when a model
-// instance is no longer needed. The backend should cleanup any state
-// associated with the model instance.
-//
-TRITONSERVER_Error*
-TRITONBACKEND_ModelInstanceFinalize(TRITONBACKEND_ModelInstance* instance)
-{
-  void* vstate;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceState(instance, &vstate));
-  ModelInstanceState* instance_state =
-      reinterpret_cast<ModelInstanceState*>(vstate);
-  delete instance_state;
-
-  return nullptr;  // success
-}
-
-}  // extern "C"
-
-/////////////
-
-extern "C" {
-
-// When Triton calls TRITONBACKEND_ModelInstanceExecute it is required
-// that a backend create a response for each request in the batch. A
-// response may be the output tensors required for that request or may
-// be an error that is returned in the response.
-//
-TRITONSERVER_Error*
-TRITONBACKEND_ModelInstanceExecute(
-    TRITONBACKEND_ModelInstance* instance, TRITONBACKEND_Request** requests,
-    const uint32_t request_count)
-{
-  // Triton will not call this function simultaneously for the same
-  // 'instance'. But since this backend could be used by multiple
-  // instances from multiple models the implementation needs to handle
-  // multiple calls to this function at the same time (with different
-  // 'instance' objects). Best practice for a high-performance
-  // implementation is to avoid introducing mutex/lock and instead use
-  // only function-local and model-instance-specific state.
-  ModelInstanceState* instance_state;
-  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceState(
-      instance, reinterpret_cast<void**>(&instance_state)));
-  ModelState* model_state = instance_state->StateForModel();
-
-  // 'responses' is initialized as a parallel array to 'requests',
-  // with one TRITONBACKEND_Response object for each
-  // TRITONBACKEND_Request object. If something goes wrong while
-  // creating these response objects, the backend simply returns an
-  // error from TRITONBACKEND_ModelInstanceExecute, indicating to
-  // Triton that this backend did not create or send any responses and
-  // so it is up to Triton to create and send an appropriate error
-  // response for each request. RETURN_IF_ERROR is one of several
-  // useful macros for error handling that can be found in
-  // backend_common.h.
+  void ProcessRequests(
+    TRITONBACKEND_Request** requests, const uint32_t request_count) {
 
   std::vector<TRITONBACKEND_Response*> responses;
   responses.reserve(request_count);
@@ -335,7 +299,7 @@ TRITONBACKEND_ModelInstanceExecute(
 
   BackendInputCollector collector(
       requests, request_count, &responses, model_state->TritonMemoryManager(),
-      false /* pinned_enabled */, nullptr /* stream*/);
+      model_state_->EnablePinnedInput() /* pinned_enabled */, nullptr /* stream*/);
 
   // To instruct ProcessTensor to "gather" the entire batch of IN0
   // input tensors into a single contiguous buffer in CPU memory, set
@@ -455,6 +419,127 @@ TRITONBACKEND_ModelInstanceExecute(
         TRITONBACKEND_RequestRelease(request, TRITONSERVER_REQUEST_RELEASE_ALL),
         "failed releasing request");
   }
+  }
+
+ private:
+
+  ModelState* model_state_;
+  ::ctranslate2::Device device_;
+  std::shared_ptr<const ::ctranslate2::models::Model> model_;
+};
+
+TRITONSERVER_Error*
+ModelInstanceState::Create(
+    ModelState* model_state, TRITONBACKEND_ModelInstance* triton_model_instance,
+    ModelInstanceState** state)
+{
+  try {
+    *state = new ModelInstanceState(model_state, triton_model_instance);
+  }
+  catch (const BackendModelInstanceException& ex) {
+    RETURN_ERROR_IF_TRUE(
+        ex.err_ == nullptr, TRITONSERVER_ERROR_INTERNAL,
+        std::string("unexpected nullptr in BackendModelInstanceException"));
+    RETURN_IF_ERROR(ex.err_);
+  }
+
+  return nullptr;  // success
+}
+
+extern "C" {
+
+// Triton calls TRITONBACKEND_ModelInstanceInitialize when a model
+// instance is created to allow the backend to initialize any state
+// associated with the instance.
+//
+TRITONSERVER_Error*
+TRITONBACKEND_ModelInstanceInitialize(TRITONBACKEND_ModelInstance* instance)
+{
+  // Get the model state associated with this instance's model.
+  TRITONBACKEND_Model* model;
+  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceModel(instance, &model));
+
+  void* vmodelstate;
+  RETURN_IF_ERROR(TRITONBACKEND_ModelState(model, &vmodelstate));
+  ModelState* model_state = reinterpret_cast<ModelState*>(vmodelstate);
+
+  // Create a ModelInstanceState object and associate it with the
+  // TRITONBACKEND_ModelInstance.
+  ModelInstanceState* instance_state;
+  RETURN_IF_ERROR(
+      ModelInstanceState::Create(model_state, instance, &instance_state));
+  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceSetState(
+      instance, reinterpret_cast<void*>(instance_state)));
+
+  return nullptr;  // success
+}
+
+// Triton calls TRITONBACKEND_ModelInstanceFinalize when a model
+// instance is no longer needed. The backend should cleanup any state
+// associated with the model instance.
+//
+TRITONSERVER_Error*
+TRITONBACKEND_ModelInstanceFinalize(TRITONBACKEND_ModelInstance* instance)
+{
+  void* vstate;
+  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceState(instance, &vstate));
+  ModelInstanceState* instance_state =
+      reinterpret_cast<ModelInstanceState*>(vstate);
+  delete instance_state;
+
+  return nullptr;  // success
+}
+
+}  // extern "C"
+
+/////////////
+
+extern "C" {
+
+// When Triton calls TRITONBACKEND_ModelInstanceExecute it is required
+// that a backend create a response for each request in the batch. A
+// response may be the output tensors required for that request or may
+// be an error that is returned in the response.
+//
+TRITONSERVER_Error*
+TRITONBACKEND_ModelInstanceExecute(
+    TRITONBACKEND_ModelInstance* instance, TRITONBACKEND_Request** requests,
+    const uint32_t request_count)
+{
+
+  uint64_t exec_start_ns = 0;
+  SET_TIMESTAMP(exec_start_ns);
+
+  // Triton will not call this function simultaneously for the same
+  // 'instance'. But since this backend could be used by multiple
+  // instances from multiple models the implementation needs to handle
+  // multiple calls to this function at the same time (with different
+  // 'instance' objects). Best practice for a high-performance
+  // implementation is to avoid introducing mutex/lock and instead use
+  // only function-local and model-instance-specific state.
+  ModelInstanceState* instance_state;
+  RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceState(
+      instance, reinterpret_cast<void**>(&instance_state)));
+  ModelState* model_state = instance_state->StateForModel();
+
+  // 'responses' is initialized as a parallel array to 'requests',
+  // with one TRITONBACKEND_Response object for each
+  // TRITONBACKEND_Request object. If something goes wrong while
+  // creating these response objects, the backend simply returns an
+  // error from TRITONBACKEND_ModelInstanceExecute, indicating to
+  // Triton that this backend did not create or send any responses and
+  // so it is up to Triton to create and send an appropriate error
+  // response for each request. RETURN_IF_ERROR is one of several
+  // useful macros for error handling that can be found in
+  // backend_common.h.
+
+  LOG_MESSAGE(
+    TRITONSERVER_LOG_VERBOSE,
+    (std::string("model ") + model_state->Name() + ", instance " +
+      instance_state->Name() + ", executing " + std::to_string(request_count) +
+      " requests")
+        .c_str());
+
 
   return nullptr;  // success
 }

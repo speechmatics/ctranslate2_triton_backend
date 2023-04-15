@@ -73,6 +73,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(repo-common repo-core repo-backend)
 
+find_package(ctranslate2)
+
 #
 # The backend must be built into a shared library. Use an ldscript to
 # hide all symbols except for the TRITONBACKEND API.
@@ -109,6 +111,7 @@ target_link_libraries(
     triton-core-backendapi  # from repo-core
     triton-core-serverstub  # from repo-core
     triton-backend-utils    # from repo-backend
+    CTranslate2::ctranslate2
 )
 
 if(WIN32)
