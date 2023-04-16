@@ -188,17 +188,6 @@ private:
 
 TRITONSERVER_Error *ModelState::Create(TRITONBACKEND_Model *triton_model,
                                        ModelState **state) {
-  TRITONSERVER_Message *config_message;
-
-  const char *buffer;
-  size_t byte_size;
-  RETURN_IF_ERROR(
-      TRITONSERVER_MessageSerializeToJson(config_message, &buffer, &byte_size));
-
-  triton::common::TritonJson::Value model_config;
-  TRITONSERVER_Error *err = model_config.Parse(buffer, byte_size);
-  RETURN_IF_ERROR(TRITONSERVER_MessageDelete(config_message));
-  RETURN_IF_ERROR(err);
 
   try {
     *state = new ModelState(triton_model);
