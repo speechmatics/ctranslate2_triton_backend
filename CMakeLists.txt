@@ -28,6 +28,14 @@ cmake_minimum_required(VERSION 3.17)
 
 project(ctranslate2backend LANGUAGES C CXX)
 
+# By default RPATH will be used in the build tree, but cleared when installing the targets, leaving an empty RPATH
+# Thus we set the RPATH explicit for the installed targets
+# add the automatically determined parts of the RPATH
+# which point to directories outside the build tree to the install RPATH
+set(CMAKE_SKIP_BUILD_RPATH  FALSE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
+set(CMAKE_INSTALL_RPATH "\${ORIGIN}")
+
 #
 # Options
 #
@@ -136,6 +144,7 @@ endif()
 include(GNUInstallDirs)
 set(INSTALL_CONFIGDIR ${CMAKE_INSTALL_LIBDIR}/cmake/CTranslate2Backend)
 
+
 install(
   TARGETS
     ctranslate2-backend
@@ -144,6 +153,9 @@ install(
   LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/ctranslate2
   RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/ctranslate2
 )
+
+install(IMPORTED_RUNTIME_ARTIFACTS CTranslate2::ctranslate2 DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/ctranslate2)
+
 
 install(
   EXPORT

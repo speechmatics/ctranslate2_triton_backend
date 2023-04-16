@@ -131,14 +131,21 @@ public:
   LoadModel(const ::ctranslate2::Device device, std::int32_t device_index,
             std::shared_ptr<const ::ctranslate2::models::Model> *ct_model) {
     std::shared_ptr<const ::ctranslate2::models::Model> model;
-    if (models_.empty()) {
-      model = ::ctranslate2::models::Model::load(*model_reader_, device,
-                                                 device_index);
-      // TODO allow to specify COMPUTE_TYPE
+    std::pair<::ctranslate2::Device, std::int32_t> device_pair =
+        std::make_pair(device, device_index);
+    auto mit = models_.find(device_pair);
+    if (mit != models_.end()) {
+      model = mit->second;
     } else {
-      model = models_.back()->copy_to(device, device_index);
+      if (!models_.empty()) {
+        model = models_.begin()->second->copy_to(device, device_index);
+      } else {
+        // TODO allow to specify COMPUTE_TYPE
+        model = ::ctranslate2::models::Model::load(*model_reader_, device,
+                                                   device_index);
+      }
+      models_.emplace(device_pair, model);
     }
-    models_.emplace_back(model);
     *ct_model = model;
 
     return nullptr;
@@ -152,7 +159,9 @@ private:
   TRITONSERVER_DataType output_type_;
   std::string model_path_;
   std::shared_ptr<::ctranslate2::models::ModelReader> model_reader_;
-  std::vector<std::shared_ptr<const ::ctranslate2::models::Model>> models_;
+  std::map<std::pair<::ctranslate2::Device, std::int32_t>,
+           std::shared_ptr<const ::ctranslate2::models::Model>>
+      models_;
 
   TRITONSERVER_Error *ValidateModel() {
     std::string artifact_filename;
