@@ -96,7 +96,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# target_compile_features(ctranslate2-backend PRIVATE cxx_std_17)
+target_compile_features(ctranslate2-backend PRIVATE cxx_std_17)
 target_compile_options(
   ctranslate2-backend PRIVATE
   $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:GNU>>:

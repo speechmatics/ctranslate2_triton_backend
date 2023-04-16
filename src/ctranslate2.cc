@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <cstddef>
+#include <cstring>
 #include <memory>
 
 #include "triton/backend/backend_common.h"
@@ -115,10 +116,16 @@ public:
     RETURN_IF_ERROR(
         output.MemberAsString("name", &output_name, &output_name_len));
     output_name_ = std::string(output_name);
+
+    std::string io_dtype;
+    RETURN_IF_ERROR(output.MemberAsString("data_type", &io_dtype));
+    output_type_ =
+        triton::backend::ModelConfigDataTypeToTritonServerDataType(io_dtype);
   }
 
   const std::string &InputTensorName() const { return input_name_; }
   const std::string &OutputTensorName() const { return output_name_; }
+  TRITONSERVER_DataType OutputDataType() const { return output_type_; }
 
   TRITONSERVER_Error *
   LoadModel(const ::ctranslate2::Device device, std::int32_t device_index,
@@ -142,6 +149,7 @@ private:
   triton::common::TritonJson::Value model_config_;
   std::string input_name_;
   std::string output_name_;
+  TRITONSERVER_DataType output_type_;
   std::string model_path_;
   std::shared_ptr<::ctranslate2::models::ModelReader> model_reader_;
   std::vector<std::shared_ptr<const ::ctranslate2::models::Model>> models_;
@@ -268,7 +276,6 @@ TRITONSERVER_Error *ToIdVector(const char *buffer,
     return ToIdVectorTyped<uint32_t>(buffer, element_cnt, ids);
   case TRITONSERVER_TYPE_UINT64:
     return ToIdVectorTyped<uint64_t>(buffer, element_cnt, ids);
-
   case TRITONSERVER_TYPE_INT8:
     return ToIdVectorTyped<int8_t>(buffer, element_cnt, ids);
   case TRITONSERVER_TYPE_INT16:
@@ -290,6 +297,76 @@ TRITONSERVER_Error *ToIdVector(const char *buffer,
                     std::string(TRITONSERVER_DataTypeString(datatype)) + "'")
             .c_str());
   }
+}
+
+template <typename T>
+std::pair<std::unique_ptr<char[]>, size_t>
+ConvertToRawPointer(const std::vector<std::size_t> &out_tokens) {
+  std::vector<T> converted(out_tokens.begin(), out_tokens.end());
+  size_t buffer_size = out_tokens.size() * sizeof(T);
+  auto buffer = std::make_unique<char[]>(buffer_size);
+  memcpy(buffer.get(), converted.data(), buffer_size);
+  return std::make_pair<>(std::move(buffer), buffer_size);
+}
+
+TRITONSERVER_Error *ToOutBuffer(const std::vector<std::size_t> &out_tokens,
+                                TRITONSERVER_DataType datatype,
+                                std::unique_ptr<char[]> *out_buffer,
+                                size_t *out_buffer_size) {
+  std::unique_ptr<char[]> buffer;
+  size_t buffer_size;
+  switch (datatype) {
+  case TRITONSERVER_TYPE_UINT8:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::uint8_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_UINT16:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::uint16_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_UINT32:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::uint32_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_UINT64:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::uint64_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_INT8:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::int8_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_INT16:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::int16_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_INT32:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::int32_t>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_INT64:
+    std::tie(buffer, buffer_size) =
+        ConvertToRawPointer<std::int64_t>(out_tokens);
+    break;
+
+  case TRITONSERVER_TYPE_FP32:
+    std::tie(buffer, buffer_size) = ConvertToRawPointer<float>(out_tokens);
+    break;
+  case TRITONSERVER_TYPE_FP64:
+    std::tie(buffer, buffer_size) = ConvertToRawPointer<double>(out_tokens);
+    break;
+  default:
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG,
+        std::string(std::string("class result not available for output due to "
+                                "unsupported type '") +
+                    std::string(TRITONSERVER_DataTypeString(datatype)) + "'")
+            .c_str());
+  }
+
+  *out_buffer = std::move(buffer);
+  *out_buffer_size = buffer_size;
+  return nullptr;
 }
 
 /////////////
@@ -444,6 +521,14 @@ public:
     return nullptr;
   }
 
+  std::vector<size_t> CreateOutput(const std::vector<std::string> &out_tokens) {
+    const ::ctranslate2::models::SequenceToSequenceModel *seq2seq_model =
+        dynamic_cast<const ::ctranslate2::models::SequenceToSequenceModel *>(
+            model_.get());
+    const auto target_vocab = seq2seq_model->get_target_vocabulary();
+    return target_vocab.to_ids({out_tokens})[0];
+  }
+
   void ProcessRequests(TRITONBACKEND_Request **requests,
                        const uint32_t request_count) {
 
@@ -561,6 +646,9 @@ public:
                                                   request_count, &responses,
                                                   collector.get(), &inputs));
 
+    std::unique_ptr<::ctranslate2::models::SequenceToSequenceReplica>
+        seq2seq_replica = model_->as_sequence_to_sequence();
+
     // Finalize the collector. If 'true' is returned, 'input_buffer'
     // will not be valid until the backend synchronizes the CUDA
     // stream or event that was used when creating the collector. For
@@ -573,26 +661,13 @@ public:
           "'minimal' backend: unexpected CUDA sync required by collector");
     }
 
-    // 'input_buffer' contains the batched "IN0" tensor. The backend can
-    // implement whatever logic is necesary to produce "OUT0". This
-    // backend simply returns the IN0 value in OUT0 so no actual
-    // computation is needed.
+    std::vector<::ctranslate2::TranslationResult> translation_results =
+        seq2seq_replica->translate(inputs);
 
     LOG_MESSAGE(TRITONSERVER_LOG_INFO,
                 (std::string("model ") + StateForModel()->Name() +
                  ": requests in batch " + std::to_string(request_count))
                     .c_str());
-    // std::string tstr;
-    // IGNORE_ERROR(BufferAsTypedString(tstr, input_buffer,
-    // input_buffer_byte_size,
-    //                                  TRITONSERVER_TYPE_INT32));
-    // LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-    //             (std::string("batched IN0 value: ") + tstr).c_str());
-
-    // TODO create output_buffer
-    const char *output_buffer = {0};
-    auto output_buffer_memory_type = TRITONSERVER_MEMORY_CPU;
-    int64_t output_buffer_memory_type_id(0);
 
     // This backend supports models that batch along the first dimension
     // and those that don't batch. For non-batch models the output shape
@@ -604,42 +679,39 @@ public:
     RESPOND_ALL_AND_SET_NULL_IF_ERROR(responses, request_count,
                                       StateForModel()->SupportsFirstDimBatching(
                                           &supports_first_dim_batching));
-    if (supports_first_dim_batching) {
-      output_batch_shape.push_back(-1);
+    size_t idx = 0;
+    for (auto &translation : translation_results) {
+
+      std::vector<std::string> out_tokens = translation.output();
+      std::vector<size_t> out_ids = CreateOutput(out_tokens);
+
+      std::unique_ptr<char[]> out_buffer;
+      size_t out_buffer_size;
+      ToOutBuffer(out_ids, StateForModel()->OutputDataType(), &out_buffer,
+                  &out_buffer_size);
+
+      TRITONBACKEND_Output *response_output;
+      std::vector<std::int64_t> out_shape = {(std::int64_t)out_ids.size()};
+      if (supports_first_dim_batching) {
+        out_shape.insert(out_shape.begin(), -1);
+      }
+
+      RESPOND_AND_SET_NULL_IF_ERROR(
+          &responses[idx], TRITONBACKEND_ResponseOutput(
+                               responses[idx], &response_output,
+                               StateForModel()->OutputTensorName().c_str(),
+                               StateForModel()->OutputDataType(),
+                               out_shape.data(), out_shape.size()));
+      if (responses[idx] != nullptr) {
+        void *out_buffer_ptr = (void *)out_buffer.get();
+        TRITONSERVER_MemoryType actual_memory_type = TRITONSERVER_MEMORY_CPU;
+        RESPOND_AND_SET_NULL_IF_ERROR(
+            &responses[idx], TRITONBACKEND_OutputBuffer(
+                                 response_output, &out_buffer_ptr,
+                                 out_buffer_size, &actual_memory_type, 0));
+      }
+      idx += 1;
     }
-    output_batch_shape.push_back(4);
-
-    // Because the OUT0 values are concatenated into a single contiguous
-    // 'output_buffer', the backend must "scatter" them out to the
-    // individual response OUT0 tensors.  The backend utilities provide
-    // a "responder" to facilitate this scattering process.
-
-    // The 'responders's ProcessTensor function will copy the portion of
-    // 'output_buffer' corresonding to each request's output into the
-    // response for that request.
-
-    BackendOutputResponder responder(
-        requests, request_count, &responses,
-        StateForModel()->TritonMemoryManager(), supports_first_dim_batching,
-        false /* pinned_enabled */, nullptr /* stream*/);
-
-    responder.ProcessTensor("OUT0", TRITONSERVER_TYPE_INT32, output_batch_shape,
-                            output_buffer, output_buffer_memory_type,
-                            output_buffer_memory_type_id);
-
-    // Finalize the responder. If 'true' is returned, the OUT0
-    // tensors' data will not be valid until the backend synchronizes
-    // the CUDA stream or event that was used when creating the
-    // responder. For this backend, GPU is not supported and so no
-    // CUDA sync should be needed; so if 'true' is returned simply log
-    // an error.
-    const bool need_cuda_output_sync = responder.Finalize();
-    if (need_cuda_output_sync) {
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_ERROR,
-          "'minimal' backend: unexpected CUDA sync required by responder");
-    }
-
     // Send all the responses that haven't already been sent because of
     // an earlier error.
     for (auto &response : responses) {
