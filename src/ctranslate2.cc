@@ -24,6 +24,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <cstddef>
 #include <memory>
 
 #include "triton/backend/backend_common.h"
@@ -34,6 +35,7 @@
 #include "triton/core/tritonbackend.h"
 
 #include "ctranslate2/models/model.h"
+#include "ctranslate2/models/sequence_to_sequence.h"
 
 namespace triton {
 namespace backend {
@@ -51,9 +53,6 @@ namespace ctranslate2 {
 //
 
 /////////////
-
-const std::string INPUT_NAME("INPUT_IDS");
-const std::string OUTPUT_NAME("OUTPUT_IDS");
 
 //
 // ModelState
@@ -75,6 +74,52 @@ public:
     THROW_IF_BACKEND_MODEL_ERROR(ValidateModel());
   }
 
+  TRITONSERVER_Error *ValidateModelConfig() {
+    // If verbose logging is enabled, dump the model's configuration as
+    // JSON into the console output.
+    if (TRITONSERVER_LogIsEnabled(TRITONSERVER_LOG_VERBOSE)) {
+      common::TritonJson::WriteBuffer buffer;
+      RETURN_IF_ERROR(ModelConfig().PrettyWrite(&buffer));
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_VERBOSE,
+          (std::string("model configuration:\n") + buffer.Contents()).c_str());
+    }
+
+    // ModelConfig is the model configuration as a TritonJson
+    // object. Use the TritonJson utilities to parse the JSON and
+    // determine if the configuration is supported by this backend.
+    common::TritonJson::Value inputs, outputs;
+    RETURN_IF_ERROR(ModelConfig().MemberAsArray("input", &inputs));
+    RETURN_IF_ERROR(ModelConfig().MemberAsArray("output", &outputs));
+
+    // The model must have exactly 1 input and 1 output.
+    RETURN_ERROR_IF_FALSE(inputs.ArraySize() == 1,
+                          TRITONSERVER_ERROR_INVALID_ARG,
+                          std::string("model configuration must have 1 input"));
+    RETURN_ERROR_IF_FALSE(
+        outputs.ArraySize() == 1, TRITONSERVER_ERROR_INVALID_ARG,
+        std::string("model configuration must have 1 output"));
+
+    common::TritonJson::Value input, output;
+    RETURN_IF_ERROR(inputs.IndexAsObject(0, &input));
+    RETURN_IF_ERROR(outputs.IndexAsObject(0, &output));
+
+    // Record the input and output name in the model state.
+    const char *input_name;
+    size_t input_name_len;
+    RETURN_IF_ERROR(input.MemberAsString("name", &input_name, &input_name_len));
+    input_name_ = std::string(input_name);
+
+    const char *output_name;
+    size_t output_name_len;
+    RETURN_IF_ERROR(
+        output.MemberAsString("name", &output_name, &output_name_len));
+    output_name_ = std::string(output_name);
+  }
+
+  const std::string &InputTensorName() const { return input_name_; }
+  const std::string &OutputTensorName() const { return output_name_; }
+
   TRITONSERVER_Error *
   LoadModel(const ::ctranslate2::Device device, std::int32_t device_index,
             std::shared_ptr<const ::ctranslate2::models::Model> *ct_model) {
@@ -95,6 +140,8 @@ public:
 private:
   TRITONBACKEND_Model *triton_model_;
   triton::common::TritonJson::Value model_config_;
+  std::string input_name_;
+  std::string output_name_;
   std::string model_path_;
   std::shared_ptr<::ctranslate2::models::ModelReader> model_reader_;
   std::vector<std::shared_ptr<const ::ctranslate2::models::Model>> models_;
@@ -197,6 +244,54 @@ TRITONSERVER_Error *TRITONBACKEND_ModelFinalize(TRITONBACKEND_Model *model) {
 
 } // extern "C"
 
+template <typename T>
+TRITONSERVER_Error *
+ToIdVectorTyped(const char *buffer, const size_t element_count,
+                std::vector<size_t> *ids, const size_t start_idx = 0) {
+  const T *vals = reinterpret_cast<const T *>(buffer);
+  *ids = std::vector<size_t>(vals[start_idx], vals[start_idx + element_count]);
+
+  return nullptr;
+}
+
+TRITONSERVER_Error *ToIdVector(const char *buffer,
+                               TRITONSERVER_DataType datatype,
+                               std::vector<size_t> *ids, const size_t start_idx,
+                               const size_t element_cnt) {
+
+  switch (datatype) {
+  case TRITONSERVER_TYPE_UINT8:
+    return ToIdVectorTyped<uint8_t>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_UINT16:
+    return ToIdVectorTyped<uint16_t>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_UINT32:
+    return ToIdVectorTyped<uint32_t>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_UINT64:
+    return ToIdVectorTyped<uint64_t>(buffer, element_cnt, ids);
+
+  case TRITONSERVER_TYPE_INT8:
+    return ToIdVectorTyped<int8_t>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_INT16:
+    return ToIdVectorTyped<int16_t>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_INT32:
+    return ToIdVectorTyped<int32_t>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_INT64:
+    return ToIdVectorTyped<int64_t>(buffer, element_cnt, ids);
+
+  case TRITONSERVER_TYPE_FP32:
+    return ToIdVectorTyped<float>(buffer, element_cnt, ids);
+  case TRITONSERVER_TYPE_FP64:
+    return ToIdVectorTyped<double>(buffer, element_cnt, ids);
+  default:
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG,
+        std::string(std::string("class result not available for output due to "
+                                "unsupported type '") +
+                    std::string(TRITONSERVER_DataTypeString(datatype)) + "'")
+            .c_str());
+  }
+}
+
 /////////////
 
 //
@@ -253,10 +348,100 @@ public:
     supports_batching_ = model_state_->MaxBatchSize() > 0;
   }
 
-  void CreateInput(size_t total_batch_size, TRITONBACKEND_Request **requests,
-                   const uint32_t request_count,
-                   std::vector<TRITONBACKEND_Response *> *responses,
-                   BackendInputCollector *collector) {
+  TRITONSERVER_Error *
+  CreateInput(size_t total_batch_size, TRITONBACKEND_Request **requests,
+              const uint32_t request_count,
+              std::vector<TRITONBACKEND_Response *> *responses,
+              BackendInputCollector *collector,
+              std::vector<std::vector<std::string>> *input_tokens) {
+
+    const char *input_buffer;
+    size_t batchn_byte_size;
+    TRITONSERVER_MemoryType memory_type;
+    int64_t memory_type_id;
+
+    // TODO support data straight from GPU
+    std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>> alloc_preference =
+        {{TRITONSERVER_MEMORY_CPU_PINNED, 0}, {TRITONSERVER_MEMORY_CPU, 0}};
+
+    RETURN_IF_ERROR(collector->ProcessTensor(
+        StateForModel()->InputTensorName().c_str(), nullptr, 0,
+        alloc_preference, &input_buffer, &batchn_byte_size, &memory_type,
+        &memory_type_id));
+
+    const ::ctranslate2::models::SequenceToSequenceModel *seq2seq_model =
+        dynamic_cast<const ::ctranslate2::models::SequenceToSequenceModel *>(
+            model_.get());
+    const auto source_vocab = seq2seq_model->get_source_vocabulary();
+
+    std::vector<std::vector<size_t>> token_ids;
+    token_ids.reserve(request_count);
+
+    if (StateForModel()->IsInputRagged(StateForModel()->InputTensorName())) {
+      int64_t total_elements = 0;
+      for (size_t request_idx = 0; request_idx < request_count; request_idx++) {
+        TRITONBACKEND_Input *input;
+        RESPOND_AND_SET_NULL_IF_ERROR(
+            &((*responses)[request_idx]),
+            TRITONBACKEND_RequestInput(
+                requests[request_idx],
+                StateForModel()->InputTensorName().c_str(), &input));
+        // RETURN_IF_ERROR(TRITONBACKEND_RequestInputx(
+        //     requests[request_idx],
+        //     StateForModel()->InputTensorName().c_str(), &input));
+
+        TRITONSERVER_DataType input_dt;
+        const int64_t *input_shape;
+        uint32_t input_dims_count;
+        RETURN_IF_ERROR(TRITONBACKEND_InputProperties(
+            input, nullptr, &input_dt, &input_shape, &input_dims_count, nullptr,
+            nullptr));
+
+        auto element_count = GetElementCount(input_shape, input_dims_count);
+
+        std::vector<size_t> ids;
+
+        ToIdVector(input_buffer, input_dt, &ids, total_elements, element_count);
+        total_elements += element_count;
+        token_ids.emplace_back(ids);
+      }
+    } else {
+      // input type is the same for all
+      TRITONBACKEND_Input *input;
+      RETURN_IF_ERROR(TRITONBACKEND_RequestInput(
+          requests[0], StateForModel()->InputTensorName().c_str(), &input));
+
+      TRITONSERVER_DataType input_dt;
+      const int64_t *input_shape;
+      uint32_t input_dims_count;
+      RETURN_IF_ERROR(
+          TRITONBACKEND_InputProperties(input, nullptr, &input_dt, &input_shape,
+                                        &input_dims_count, nullptr, nullptr));
+
+      if (input_dims_count > 2) {
+        return TRITONSERVER_ErrorNew(
+            TRITONSERVER_ERROR_INVALID_ARG,
+            std::string("Inputs with more than two dimensions unsupported")
+                .c_str());
+      }
+
+      std::vector<int64_t> batchn_shape =
+          std::vector<int64_t>(input_shape, input_shape + input_dims_count);
+      if (supports_batching_) {
+        batchn_shape[0] = total_batch_size;
+      }
+
+      for (size_t vector_idx = 0; vector_idx < total_batch_size; vector_idx++) {
+        std::vector<size_t> ids;
+        ToIdVector(input_buffer, input_dt, &ids, vector_idx * batchn_shape[1],
+                   (vector_idx + 1) * batchn_shape[1]);
+        token_ids.emplace_back(ids);
+      }
+    }
+
+    *input_tokens = source_vocab.to_tokens(token_ids);
+
+    return nullptr;
   }
 
   void ProcessRequests(TRITONBACKEND_Request **requests,
@@ -364,40 +549,24 @@ public:
     // created, so use ProcessTensor arguments that cause collector to
     // manage it.
 
-    BackendInputCollector collector(
+    auto collector = std::make_unique<BackendInputCollector>(
         requests, request_count, &responses,
         model_state_->TritonMemoryManager(),
         model_state_->EnablePinnedInput() /* pinned_enabled */,
         nullptr /* stream*/);
 
-    // To instruct ProcessTensor to "gather" the entire batch of IN0
-    // input tensors into a single contiguous buffer in CPU memory, set
-    // the "allowed input types" to be the CPU ones (see tritonserver.h
-    // in the triton-inference-server/core repo for allowed memory
-    // types).
-    std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>>
-        allowed_input_types = {{TRITONSERVER_MEMORY_CPU_PINNED, 0},
-                               {TRITONSERVER_MEMORY_CPU, 0}};
-
-    const char *input_buffer;
-    size_t input_buffer_byte_size;
-    TRITONSERVER_MemoryType input_buffer_memory_type;
-    int64_t input_buffer_memory_type_id;
-
-    RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-        responses, request_count,
-        collector.ProcessTensor(
-            "IN0", nullptr /* existing_buffer */,
-            0 /* existing_buffer_byte_size */, allowed_input_types,
-            &input_buffer, &input_buffer_byte_size, &input_buffer_memory_type,
-            &input_buffer_memory_type_id));
+    std::vector<std::vector<std::string>> inputs;
+    RESPOND_ALL_AND_SET_NULL_IF_ERROR(responses, request_count,
+                                      CreateInput(total_batch_size, requests,
+                                                  request_count, &responses,
+                                                  collector.get(), &inputs));
 
     // Finalize the collector. If 'true' is returned, 'input_buffer'
     // will not be valid until the backend synchronizes the CUDA
     // stream or event that was used when creating the collector. For
     // this backend, GPU is not supported and so no CUDA sync should
     // be needed; so if 'true' is returned simply log an error.
-    const bool need_cuda_input_sync = collector.Finalize();
+    const bool need_cuda_input_sync = collector->Finalize();
     if (need_cuda_input_sync) {
       LOG_MESSAGE(
           TRITONSERVER_LOG_ERROR,
@@ -410,19 +579,20 @@ public:
     // computation is needed.
 
     LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-                (std::string("model ") + model_state->Name() +
+                (std::string("model ") + StateForModel()->Name() +
                  ": requests in batch " + std::to_string(request_count))
                     .c_str());
-    std::string tstr;
-    IGNORE_ERROR(BufferAsTypedString(tstr, input_buffer, input_buffer_byte_size,
-                                     TRITONSERVER_TYPE_INT32));
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-                (std::string("batched IN0 value: ") + tstr).c_str());
+    // std::string tstr;
+    // IGNORE_ERROR(BufferAsTypedString(tstr, input_buffer,
+    // input_buffer_byte_size,
+    //                                  TRITONSERVER_TYPE_INT32));
+    // LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+    //             (std::string("batched IN0 value: ") + tstr).c_str());
 
-    const char *output_buffer = input_buffer;
-    TRITONSERVER_MemoryType output_buffer_memory_type =
-        input_buffer_memory_type;
-    int64_t output_buffer_memory_type_id = input_buffer_memory_type_id;
+    // TODO create output_buffer
+    const char *output_buffer = {0};
+    auto output_buffer_memory_type = TRITONSERVER_MEMORY_CPU;
+    int64_t output_buffer_memory_type_id(0);
 
     // This backend supports models that batch along the first dimension
     // and those that don't batch. For non-batch models the output shape
@@ -431,9 +601,9 @@ public:
     // appropriate batch dimension value for each response.
     std::vector<int64_t> output_batch_shape;
     bool supports_first_dim_batching;
-    RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-        responses, request_count,
-        model_state->SupportsFirstDimBatching(&supports_first_dim_batching));
+    RESPOND_ALL_AND_SET_NULL_IF_ERROR(responses, request_count,
+                                      StateForModel()->SupportsFirstDimBatching(
+                                          &supports_first_dim_batching));
     if (supports_first_dim_batching) {
       output_batch_shape.push_back(-1);
     }
@@ -449,9 +619,9 @@ public:
     // response for that request.
 
     BackendOutputResponder responder(
-        requests, request_count, &responses, model_state->TritonMemoryManager(),
-        supports_first_dim_batching, false /* pinned_enabled */,
-        nullptr /* stream*/);
+        requests, request_count, &responses,
+        StateForModel()->TritonMemoryManager(), supports_first_dim_batching,
+        false /* pinned_enabled */, nullptr /* stream*/);
 
     responder.ProcessTensor("OUT0", TRITONSERVER_TYPE_INT32, output_batch_shape,
                             output_buffer, output_buffer_memory_type,
@@ -570,9 +740,6 @@ TRITONSERVER_Error *
 TRITONBACKEND_ModelInstanceExecute(TRITONBACKEND_ModelInstance *instance,
                                    TRITONBACKEND_Request **requests,
                                    const uint32_t request_count) {
-
-  uint64_t exec_start_ns = 0;
-  SET_TIMESTAMP(exec_start_ns);
 
   // Triton will not call this function simultaneously for the same
   // 'instance'. But since this backend could be used by multiple
