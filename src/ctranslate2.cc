@@ -37,6 +37,7 @@
 
 #include "ctranslate2/models/model.h"
 #include "ctranslate2/models/sequence_to_sequence.h"
+#include "triton/core/tritonserver.h"
 
 namespace triton {
 namespace backend {
@@ -73,6 +74,7 @@ public:
   ModelState(TRITONBACKEND_Model *triton_model)
       : BackendModel(triton_model, false) {
     THROW_IF_BACKEND_MODEL_ERROR(ValidateModel());
+    THROW_IF_BACKEND_MODEL_ERROR(ValidateModelConfig());
   }
 
   TRITONSERVER_Error *ValidateModelConfig() {
@@ -121,6 +123,8 @@ public:
     RETURN_IF_ERROR(output.MemberAsString("data_type", &io_dtype));
     output_type_ =
         triton::backend::ModelConfigDataTypeToTritonServerDataType(io_dtype);
+
+    return nullptr;
   }
 
   const std::string &InputTensorName() const { return input_name_; }
@@ -152,7 +156,7 @@ public:
   }
 
 private:
-  TRITONBACKEND_Model *triton_model_;
+  // TRITONBACKEND_Model *triton_model_;
   triton::common::TritonJson::Value model_config_;
   std::string input_name_;
   std::string output_name_;
@@ -255,8 +259,7 @@ TRITONSERVER_Error *
 ToIdVectorTyped(const char *buffer, const size_t element_count,
                 std::vector<size_t> *ids, const size_t start_idx = 0) {
   const T *vals = reinterpret_cast<const T *>(buffer);
-  *ids = std::vector<size_t>(vals[start_idx], vals[start_idx + element_count]);
-
+  *ids = std::vector<size_t>(vals, vals + element_count);
   return nullptr;
 }
 
@@ -267,26 +270,26 @@ TRITONSERVER_Error *ToIdVector(const char *buffer,
 
   switch (datatype) {
   case TRITONSERVER_TYPE_UINT8:
-    return ToIdVectorTyped<uint8_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<uint8_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_UINT16:
-    return ToIdVectorTyped<uint16_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<uint16_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_UINT32:
-    return ToIdVectorTyped<uint32_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<uint32_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_UINT64:
-    return ToIdVectorTyped<uint64_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<uint64_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_INT8:
-    return ToIdVectorTyped<int8_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<int8_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_INT16:
-    return ToIdVectorTyped<int16_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<int16_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_INT32:
-    return ToIdVectorTyped<int32_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<int32_t>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_INT64:
-    return ToIdVectorTyped<int64_t>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<int64_t>(buffer, element_cnt, ids, start_idx);
 
   case TRITONSERVER_TYPE_FP32:
-    return ToIdVectorTyped<float>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<float>(buffer, element_cnt, ids, start_idx);
   case TRITONSERVER_TYPE_FP64:
-    return ToIdVectorTyped<double>(buffer, element_cnt, ids);
+    return ToIdVectorTyped<double>(buffer, element_cnt, ids, start_idx);
   default:
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_INVALID_ARG,
@@ -297,61 +300,78 @@ TRITONSERVER_Error *ToIdVector(const char *buffer,
   }
 }
 
-template <typename T>
-std::pair<std::unique_ptr<char[]>, size_t>
-ConvertToRawPointer(const std::vector<std::size_t> &out_tokens) {
-  std::vector<T> converted(out_tokens.begin(), out_tokens.end());
-  size_t buffer_size = out_tokens.size() * sizeof(T);
-  auto buffer = std::make_unique<char[]>(buffer_size);
-  memcpy(buffer.get(), converted.data(), buffer_size);
-  return std::make_pair<>(std::move(buffer), buffer_size);
+template <typename T> void
+ConvertToRawPointer(const std::vector<std::size_t> &out_tokens, void* out_buffer) {
+  T *buffer = static_cast<T*>(out_buffer);
+  for (auto &token : out_tokens) {
+    auto idx = &token - &out_tokens[0];
+    buffer[idx] = static_cast<T>(token);
+  }
+}
+
+size_t TritonTypeSize(TRITONSERVER_DataType datatype) {
+  switch (datatype) {
+  case TRITONSERVER_TYPE_UINT8:
+    return sizeof(std::uint8_t);
+  case TRITONSERVER_TYPE_UINT16:
+    return sizeof(std::uint16_t);
+  case TRITONSERVER_TYPE_UINT32:
+    return sizeof(std::uint32_t);
+  case TRITONSERVER_TYPE_UINT64:
+    return sizeof(std::uint64_t);
+  case TRITONSERVER_TYPE_INT8:
+    return sizeof(std::int8_t);
+  case TRITONSERVER_TYPE_INT16:
+    return sizeof(std::int16_t);
+  case TRITONSERVER_TYPE_INT32:
+    return sizeof(std::int32_t);
+  case TRITONSERVER_TYPE_INT64:
+    return sizeof(std::int64_t);
+    break;
+
+  case TRITONSERVER_TYPE_FP32:
+    return sizeof(std::float_t);
+  case TRITONSERVER_TYPE_FP64:
+    return sizeof(std::double_t);
+  default:
+    throw std::invalid_argument(std::string("Can't determine type size for ") + std::to_string(TRITONSERVER_TYPE_FP64));
+  }
 }
 
 TRITONSERVER_Error *ToOutBuffer(const std::vector<std::size_t> &out_tokens,
                                 TRITONSERVER_DataType datatype,
-                                std::unique_ptr<char[]> *out_buffer,
-                                size_t *out_buffer_size) {
-  std::unique_ptr<char[]> buffer;
-  size_t buffer_size;
+                                void *out_buffer) {
   switch (datatype) {
   case TRITONSERVER_TYPE_UINT8:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::uint8_t>(out_tokens);
+        ConvertToRawPointer<std::uint8_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_UINT16:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::uint16_t>(out_tokens);
+        ConvertToRawPointer<std::uint16_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_UINT32:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::uint32_t>(out_tokens);
+        ConvertToRawPointer<std::uint32_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_UINT64:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::uint64_t>(out_tokens);
+        ConvertToRawPointer<std::uint64_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT8:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::int8_t>(out_tokens);
+        ConvertToRawPointer<std::int8_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT16:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::int16_t>(out_tokens);
+        ConvertToRawPointer<std::int16_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT32:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::int32_t>(out_tokens);
+        ConvertToRawPointer<std::int32_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT64:
-    std::tie(buffer, buffer_size) =
-        ConvertToRawPointer<std::int64_t>(out_tokens);
+        ConvertToRawPointer<std::int64_t>(out_tokens, out_buffer);
     break;
 
   case TRITONSERVER_TYPE_FP32:
-    std::tie(buffer, buffer_size) = ConvertToRawPointer<float>(out_tokens);
+    ConvertToRawPointer<float>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_FP64:
-    std::tie(buffer, buffer_size) = ConvertToRawPointer<double>(out_tokens);
+    ConvertToRawPointer<double>(out_tokens, out_buffer);
     break;
   default:
     return TRITONSERVER_ErrorNew(
@@ -362,8 +382,6 @@ TRITONSERVER_Error *ToOutBuffer(const std::vector<std::size_t> &out_tokens,
             .c_str());
   }
 
-  *out_buffer = std::move(buffer);
-  *out_buffer_size = buffer_size;
   return nullptr;
 }
 
@@ -452,7 +470,19 @@ public:
     std::vector<std::vector<size_t>> token_ids;
     token_ids.reserve(request_count);
 
-    if (StateForModel()->IsInputRagged(StateForModel()->InputTensorName())) {
+    bool is_ragged =
+        StateForModel()->IsInputRagged(StateForModel()->InputTensorName());
+
+    std::string tstr;
+    IGNORE_ERROR(BufferAsTypedString(tstr, input_buffer, batchn_byte_size,
+                                     TRITONSERVER_TYPE_INT32));
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                (std::string("batched input ") + tstr).c_str());
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_VERBOSE,
+        (std::string("Input ragged: ") + std::to_string(is_ragged)).c_str());
+
+    if (is_ragged) {
       int64_t total_elements = 0;
       for (size_t request_idx = 0; request_idx < request_count; request_idx++) {
         TRITONBACKEND_Input *input;
@@ -461,9 +491,6 @@ public:
             TRITONBACKEND_RequestInput(
                 requests[request_idx],
                 StateForModel()->InputTensorName().c_str(), &input));
-        // RETURN_IF_ERROR(TRITONBACKEND_RequestInputx(
-        //     requests[request_idx],
-        //     StateForModel()->InputTensorName().c_str(), &input));
 
         TRITONSERVER_DataType input_dt;
         const int64_t *input_shape;
@@ -473,6 +500,11 @@ public:
             nullptr));
 
         auto element_count = GetElementCount(input_shape, input_dims_count);
+        LOG_MESSAGE(TRITONSERVER_LOG_VERBOSE,
+                    (std::string("Element count for request ") +
+                     std::to_string(request_idx) + std::string(": ") +
+                     std::to_string(element_count))
+                        .c_str());
 
         std::vector<size_t> ids;
 
@@ -554,8 +586,8 @@ public:
         // Retrieve the batch size from one of the inputs, if the model
         // supports batching, the first dimension size is batch size.
         TRITONBACKEND_Input *input;
-        TRITONSERVER_Error *err = TRITONBACKEND_RequestInputByIndex(
-            requests[i], 0 /* index */, &input);
+        TRITONSERVER_Error *err = TRITONBACKEND_RequestInput(
+            requests[i], StateForModel()->InputTensorName().c_str(), &input);
         if (err == nullptr) {
           const int64_t *shape;
           err = TRITONBACKEND_InputProperties(input, nullptr, nullptr, &shape,
@@ -683,11 +715,6 @@ public:
       std::vector<std::string> out_tokens = translation.output();
       std::vector<size_t> out_ids = CreateOutput(out_tokens);
 
-      std::unique_ptr<char[]> out_buffer;
-      size_t out_buffer_size;
-      ToOutBuffer(out_ids, StateForModel()->OutputDataType(), &out_buffer,
-                  &out_buffer_size);
-
       TRITONBACKEND_Output *response_output;
       std::vector<std::int64_t> out_shape = {(std::int64_t)out_ids.size()};
       if (supports_first_dim_batching) {
@@ -701,12 +728,15 @@ public:
                                StateForModel()->OutputDataType(),
                                out_shape.data(), out_shape.size()));
       if (responses[idx] != nullptr) {
-        void *out_buffer_ptr = (void *)out_buffer.get();
+        void *out_buffer;
+        size_t out_buffer_size = TritonTypeSize(StateForModel()->OutputDataType()) * out_ids.size();
         TRITONSERVER_MemoryType actual_memory_type = TRITONSERVER_MEMORY_CPU;
+        int64_t actual_memory_type_id = 0;
         RESPOND_AND_SET_NULL_IF_ERROR(
             &responses[idx], TRITONBACKEND_OutputBuffer(
-                                 response_output, &out_buffer_ptr,
-                                 out_buffer_size, &actual_memory_type, 0));
+                                 response_output, &out_buffer, out_buffer_size,
+                                 &actual_memory_type, &actual_memory_type_id));
+        ToOutBuffer(out_ids, StateForModel()->OutputDataType(), out_buffer);
       }
       idx += 1;
     }
