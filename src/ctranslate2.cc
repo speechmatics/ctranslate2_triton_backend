@@ -33,6 +33,7 @@
 #include "triton/backend/backend_model.h"
 #include "triton/backend/backend_model_instance.h"
 #include "triton/backend/backend_output_responder.h"
+#include "triton/common/triton_json.h"
 #include "triton/core/tritonbackend.h"
 
 #include "ctranslate2/models/model.h"
@@ -43,28 +44,37 @@ namespace triton {
 namespace backend {
 namespace ctranslate2 {
 
-//
-// Minimal backend that demonstrates the TRITONBACKEND API. This
-// backend works for any model that has 1 input called "IN0" with
-// INT32 datatype and shape [ 4 ] and 1 output called "OUT0" with
-// INT32 datatype and shape [ 4 ]. The backend supports both batching
-// and non-batching models.
-//
-// For each batch of requests, the backend returns the input tensor
-// value in the output tensor.
-//
+TRITONSERVER_Error *
+ReadParameter(const triton::common::TritonJson::Value &params,
+              const std::string &key, std::string *param) {
+  triton::common::TritonJson::Value value;
+  RETURN_ERROR_IF_FALSE(
+      const_cast<triton::common::TritonJson::Value &>(params).Find(key.c_str(),
+                                                                   &value),
+      TRITONSERVER_ERROR_INVALID_ARG,
+      std::string("model configuration is missing the parameter ") + key);
+  RETURN_IF_ERROR(value.MemberAsString("string_value", param));
+  return nullptr; // success
+}
 
-/////////////
+TRITONSERVER_Error *
+ReadParameter(const triton::common::TritonJson::Value &params,
+              const std::string &key, int *param) {
+  std::string tmp;
+  RETURN_IF_ERROR(ReadParameter(params, key, &tmp));
+  *param = std::stoi(tmp);
+  return nullptr; // success
+}
 
-//
-// ModelState
-//
-// State associated with a model that is using this backend. An object
-// of this class is created and associated with each
-// TRITONBACKEND_Model. ModelState is derived from BackendModel class
-// provided in the backend utilities that provides many common
-// functions.
-//
+TRITONSERVER_Error *
+ReadParameter(const triton::common::TritonJson::Value &params,
+              const std::string &key, float *param) {
+  std::string tmp;
+  RETURN_IF_ERROR(ReadParameter(params, key, &tmp));
+  *param = std::stof(tmp);
+  return nullptr; // success
+}
+
 class ModelState : public BackendModel {
 public:
   static TRITONSERVER_Error *Create(TRITONBACKEND_Model *triton_model,
@@ -124,6 +134,21 @@ public:
     output_type_ =
         triton::backend::ModelConfigDataTypeToTritonServerDataType(io_dtype);
 
+    triton::common::TritonJson::Value params;
+    bool has_params = ModelConfig().Find("parameters", &params);
+    if (has_params) {
+      if (params.Find("compute_type")) {
+        std::string compute_type_str;
+        RETURN_IF_ERROR(
+            ReadParameter(params, "compute_type", &compute_type_str));
+        compute_type_ = ::ctranslate2::str_to_compute_type(compute_type_str);
+
+        LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                    (std::string("Running inference in compute type: ") +
+                     compute_type_str)
+                        .c_str());
+      }
+    }
     return nullptr;
   }
 
@@ -144,9 +169,8 @@ public:
       if (!models_.empty()) {
         model = models_.begin()->second->copy_to(device, device_index);
       } else {
-        // TODO allow to specify COMPUTE_TYPE
         model = ::ctranslate2::models::Model::load(*model_reader_, device,
-                                                   device_index);
+                                                   device_index, compute_type_);
       }
       models_.emplace(device_pair, model);
     }
@@ -161,6 +185,8 @@ private:
   std::string input_name_;
   std::string output_name_;
   TRITONSERVER_DataType output_type_;
+  ::ctranslate2::ComputeType compute_type_ =
+      ::ctranslate2::ComputeType::DEFAULT;
   std::string model_path_;
   std::shared_ptr<::ctranslate2::models::ModelReader> model_reader_;
   std::map<std::pair<::ctranslate2::Device, std::int32_t>,
@@ -416,21 +442,6 @@ public:
     if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
 #ifdef TRITON_ENABLE_GPU
       device_ = ::ctranslate2::Device::CUDA;
-
-      // Need to set the CUDA context so that the context that events are
-      // created on match with contexts that events are recorded with.
-      THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
-          cudaSetDevice(DeviceId()), TRITONSERVER_ERROR_INTERNAL,
-          "Failed to set the device"));
-      THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
-          cudaEventCreate(&compute_input_start_event_),
-          TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
-      THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
-          cudaEventCreate(&compute_infer_start_event_),
-          TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
-      THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
-          cudaEventCreate(&compute_output_start_event_),
-          TRITONSERVER_ERROR_INTERNAL, "Failed to create cuda event"));
 #else
       throw triton::backend::BackendModelInstanceException(
           TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_NOT_FOUND,
@@ -448,6 +459,7 @@ public:
               const uint32_t request_count,
               std::vector<TRITONBACKEND_Response *> *responses,
               BackendInputCollector *collector,
+              const ::ctranslate2::Vocabulary &source_vocab,
               std::vector<std::vector<std::string>> *input_tokens) {
 
     const char *input_buffer;
@@ -464,11 +476,6 @@ public:
         alloc_preference, &input_buffer, &batchn_byte_size, &memory_type,
         &memory_type_id));
 
-    const ::ctranslate2::models::SequenceToSequenceModel *seq2seq_model =
-        dynamic_cast<const ::ctranslate2::models::SequenceToSequenceModel *>(
-            model_.get());
-    const auto source_vocab = seq2seq_model->get_source_vocabulary();
-
     std::vector<std::vector<size_t>> token_ids;
     token_ids.reserve(request_count);
 
@@ -478,8 +485,6 @@ public:
     std::string tstr;
     IGNORE_ERROR(BufferAsTypedString(tstr, input_buffer, batchn_byte_size,
                                      TRITONSERVER_TYPE_INT32));
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-                (std::string("batched input ") + tstr).c_str());
     LOG_MESSAGE(
         TRITONSERVER_LOG_VERBOSE,
         (std::string("Input ragged: ") + std::to_string(is_ragged)).c_str());
@@ -553,24 +558,12 @@ public:
     return nullptr;
   }
 
-  std::vector<size_t> CreateOutput(const std::vector<std::string> &out_tokens) {
-    const ::ctranslate2::models::SequenceToSequenceModel *seq2seq_model =
-        dynamic_cast<const ::ctranslate2::models::SequenceToSequenceModel *>(
-            model_.get());
-    const auto target_vocab = seq2seq_model->get_target_vocabulary();
-    return target_vocab.to_ids({out_tokens})[0];
-  }
-
   void ProcessRequests(TRITONBACKEND_Request **requests,
                        const uint32_t request_count) {
 
     uint64_t exec_start_ns = 0;
     SET_TIMESTAMP(exec_start_ns);
 
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-                (std::string("model ") + StateForModel()->Name() +
-                 ": requests in batch " + std::to_string(request_count))
-                    .c_str());
     std::vector<TRITONBACKEND_Response *> responses;
     responses.reserve(request_count);
     bool all_response_failed = false;
@@ -636,42 +629,11 @@ public:
       }
     }
 
-    // At this point, the backend takes ownership of 'requests', which
-    // means that it is responsible for sending a response for every
-    // request. From here, even if something goes wrong in processing,
-    // the backend must return 'nullptr' from this function to indicate
-    // success. Any errors and failures must be communicated via the
-    // response objects.
-    //
-    // To simplify error handling, the backend utilities manage
-    // 'responses' in a specific way and it is recommended that backends
-    // follow this same pattern. When an error is detected in the
-    // processing of a request, an appropriate error response is sent
-    // and the corresponding TRITONBACKEND_Response object within
-    // 'responses' is set to nullptr to indicate that the
-    // request/response has already been handled and no futher processing
-    // should be performed for that request. Even if all responses fail,
-    // the backend still allows execution to flow to the end of the
-    // function. RESPOND_AND_SET_NULL_IF_ERROR, and
-    // RESPOND_ALL_AND_SET_NULL_IF_ERROR are macros from
-    // backend_common.h that assist in this management of response
-    // objects.
-
-    // The backend could iterate over the 'requests' and process each
-    // one separately. But for performance reasons it is usually
-    // preferred to create batched input tensors that are processed
-    // simultaneously. This is especially true for devices like GPUs
-    // that are capable of exploiting the large amount parallelism
-    // exposed by larger data sets.
-    //
-    // The backend utilities provide a "collector" to facilitate this
-    // batching process. The 'collector's ProcessTensor function will
-    // combine a tensor's value from each request in the batch into a
-    // single contiguous buffer. The buffer can be provided by the
-    // backend or 'collector' can create and manage it. In this backend,
-    // there is not a specific buffer into which the batch should be
-    // created, so use ProcessTensor arguments that cause collector to
-    // manage it.
+    const ::ctranslate2::models::SequenceToSequenceModel *seq2seq_model =
+        dynamic_cast<const ::ctranslate2::models::SequenceToSequenceModel *>(
+            model_.get());
+    const auto source_vocab = seq2seq_model->get_source_vocabulary();
+    const auto target_vocab = seq2seq_model->get_target_vocabulary();
 
     auto collector = std::make_unique<BackendInputCollector>(
         requests, request_count, &responses,
@@ -680,10 +642,10 @@ public:
         nullptr /* stream*/);
 
     std::vector<std::vector<std::string>> inputs;
-    RESPOND_ALL_AND_SET_NULL_IF_ERROR(responses, request_count,
-                                      CreateInput(total_batch_size, requests,
-                                                  request_count, &responses,
-                                                  collector.get(), &inputs));
+    RESPOND_ALL_AND_SET_NULL_IF_ERROR(
+        responses, request_count,
+        CreateInput(total_batch_size, requests, request_count, &responses,
+                    collector.get(), source_vocab, &inputs));
 
     std::unique_ptr<::ctranslate2::models::SequenceToSequenceReplica>
         seq2seq_replica = model_->as_sequence_to_sequence();
@@ -695,9 +657,8 @@ public:
     // be needed; so if 'true' is returned simply log an error.
     const bool need_cuda_input_sync = collector->Finalize();
     if (need_cuda_input_sync) {
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_ERROR,
-          "'minimal' backend: unexpected CUDA sync required by collector");
+      LOG_MESSAGE(TRITONSERVER_LOG_ERROR,
+                  "backend: unexpected CUDA sync required by collector");
     }
 
     uint64_t compute_start_ns = 0;
@@ -722,7 +683,8 @@ public:
     for (auto &translation : translation_results) {
 
       std::vector<std::string> out_tokens = translation.output();
-      std::vector<size_t> out_ids = CreateOutput(out_tokens);
+      // only output best hypotheses
+      std::vector<size_t> out_ids = target_vocab.to_ids({out_tokens})[0];
 
       TRITONBACKEND_Output *response_output;
       std::vector<std::int64_t> out_shape = {(std::int64_t)out_ids.size()};
@@ -776,9 +738,8 @@ public:
 #ifdef TRITON_ENABLE_STATS
       // Report batch statistics.
       LOG_IF_ERROR(TRITONBACKEND_ModelInstanceReportBatchStatistics(
-                       TritonModelInstance(), total_batch_size,
-                       exec_start_ns, compute_start_ns, compute_end_ns,
-                       exec_end_ns),
+                       TritonModelInstance(), total_batch_size, exec_start_ns,
+                       compute_start_ns, compute_end_ns, exec_end_ns),
                    "failed reporting batch request statistics");
 #endif // TRITON_ENABLE_STATS
     }
@@ -888,7 +849,7 @@ TRITONBACKEND_ModelInstanceExecute(TRITONBACKEND_ModelInstance *instance,
   // useful macros for error handling that can be found in
   // backend_common.h.
 
-  LOG_MESSAGE(TRITONSERVER_LOG_VERBOSE,
+  LOG_MESSAGE(TRITONSERVER_LOG_INFO,
               (std::string("model ") + model_state->Name() + ", instance " +
                instance_state->Name() + ", executing " +
                std::to_string(request_count) + " requests")
