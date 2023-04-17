@@ -300,9 +300,10 @@ TRITONSERVER_Error *ToIdVector(const char *buffer,
   }
 }
 
-template <typename T> void
-ConvertToRawPointer(const std::vector<std::size_t> &out_tokens, void* out_buffer) {
-  T *buffer = static_cast<T*>(out_buffer);
+template <typename T>
+void ConvertToRawPointer(const std::vector<std::size_t> &out_tokens,
+                         void *out_buffer) {
+  T *buffer = static_cast<T *>(out_buffer);
   for (auto &token : out_tokens) {
     auto idx = &token - &out_tokens[0];
     buffer[idx] = static_cast<T>(token);
@@ -334,7 +335,8 @@ size_t TritonTypeSize(TRITONSERVER_DataType datatype) {
   case TRITONSERVER_TYPE_FP64:
     return sizeof(std::double_t);
   default:
-    throw std::invalid_argument(std::string("Can't determine type size for ") + std::to_string(TRITONSERVER_TYPE_FP64));
+    throw std::invalid_argument(std::string("Can't determine type size for ") +
+                                std::to_string(TRITONSERVER_TYPE_FP64));
   }
 }
 
@@ -343,28 +345,28 @@ TRITONSERVER_Error *ToOutBuffer(const std::vector<std::size_t> &out_tokens,
                                 void *out_buffer) {
   switch (datatype) {
   case TRITONSERVER_TYPE_UINT8:
-        ConvertToRawPointer<std::uint8_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::uint8_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_UINT16:
-        ConvertToRawPointer<std::uint16_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::uint16_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_UINT32:
-        ConvertToRawPointer<std::uint32_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::uint32_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_UINT64:
-        ConvertToRawPointer<std::uint64_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::uint64_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT8:
-        ConvertToRawPointer<std::int8_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::int8_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT16:
-        ConvertToRawPointer<std::int16_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::int16_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT32:
-        ConvertToRawPointer<std::int32_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::int32_t>(out_tokens, out_buffer);
     break;
   case TRITONSERVER_TYPE_INT64:
-        ConvertToRawPointer<std::int64_t>(out_tokens, out_buffer);
+    ConvertToRawPointer<std::int64_t>(out_tokens, out_buffer);
     break;
 
   case TRITONSERVER_TYPE_FP32:
@@ -562,6 +564,13 @@ public:
   void ProcessRequests(TRITONBACKEND_Request **requests,
                        const uint32_t request_count) {
 
+    uint64_t exec_start_ns = 0;
+    SET_TIMESTAMP(exec_start_ns);
+
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                (std::string("model ") + StateForModel()->Name() +
+                 ": requests in batch " + std::to_string(request_count))
+                    .c_str());
     std::vector<TRITONBACKEND_Response *> responses;
     responses.reserve(request_count);
     bool all_response_failed = false;
@@ -691,13 +700,13 @@ public:
           "'minimal' backend: unexpected CUDA sync required by collector");
     }
 
+    uint64_t compute_start_ns = 0;
+    SET_TIMESTAMP(compute_start_ns);
     std::vector<::ctranslate2::TranslationResult> translation_results =
         seq2seq_replica->translate(inputs);
 
-    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
-                (std::string("model ") + StateForModel()->Name() +
-                 ": requests in batch " + std::to_string(request_count))
-                    .c_str());
+    uint64_t compute_end_ns = 0;
+    SET_TIMESTAMP(compute_end_ns);
 
     // This backend supports models that batch along the first dimension
     // and those that don't batch. For non-batch models the output shape
@@ -729,7 +738,8 @@ public:
                                out_shape.data(), out_shape.size()));
       if (responses[idx] != nullptr) {
         void *out_buffer;
-        size_t out_buffer_size = TritonTypeSize(StateForModel()->OutputDataType()) * out_ids.size();
+        size_t out_buffer_size =
+            TritonTypeSize(StateForModel()->OutputDataType()) * out_ids.size();
         TRITONSERVER_MemoryType actual_memory_type = TRITONSERVER_MEMORY_CPU;
         int64_t actual_memory_type_id = 0;
         RESPOND_AND_SET_NULL_IF_ERROR(
@@ -757,6 +767,20 @@ public:
       LOG_IF_ERROR(TRITONBACKEND_RequestRelease(
                        request, TRITONSERVER_REQUEST_RELEASE_ALL),
                    "failed releasing request");
+    }
+
+    uint64_t exec_end_ns = 0;
+    SET_TIMESTAMP(exec_end_ns);
+
+    if (!all_response_failed) {
+#ifdef TRITON_ENABLE_STATS
+      // Report batch statistics.
+      LOG_IF_ERROR(TRITONBACKEND_ModelInstanceReportBatchStatistics(
+                       TritonModelInstance(), total_batch_size,
+                       exec_start_ns, compute_start_ns, compute_end_ns,
+                       exec_end_ns),
+                   "failed reporting batch request statistics");
+#endif // TRITON_ENABLE_STATS
     }
   }
 
