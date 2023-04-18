@@ -330,7 +330,7 @@ TRITONSERVER_Error *
 ToIdVectorTyped(const char *buffer, const size_t element_count,
                 std::vector<size_t> *ids, const size_t start_idx = 0) {
   const T *vals = reinterpret_cast<const T *>(buffer);
-  *ids = std::vector<size_t>(vals, vals + element_count);
+  *ids = std::vector<size_t>(vals + start_idx, vals + start_idx + element_count);
   return nullptr;
 }
 
