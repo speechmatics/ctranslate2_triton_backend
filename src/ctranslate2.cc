@@ -31,6 +31,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "triton/backend/backend_common.h"
 #include "triton/backend/backend_input_collector.h"
@@ -330,7 +331,8 @@ TRITONSERVER_Error *
 ToIdVectorTyped(const char *buffer, const size_t element_count,
                 std::vector<size_t> *ids, const size_t start_idx = 0) {
   const T *vals = reinterpret_cast<const T *>(buffer);
-  *ids = std::vector<size_t>(vals + start_idx, vals + start_idx + element_count);
+  *ids =
+      std::vector<size_t>(vals + start_idx, vals + start_idx + element_count);
   return nullptr;
 }
 
@@ -461,6 +463,7 @@ TRITONSERVER_Error *ToOutBuffer(const std::vector<std::size_t> &out_tokens,
 std::string
 TranslationOptionsToString(const ::ctranslate2::TranslationOptions &options) {
   std::stringstream ss;
+
   ss << "TranslationOptions("
      << "beam_size=" << options.beam_size << ", "
      << "patience=" << options.patience << ", "
@@ -470,9 +473,26 @@ TranslationOptionsToString(const ::ctranslate2::TranslationOptions &options) {
      << "no_repeat_ngram_size=" << options.no_repeat_ngram_size << ", "
      << "disable_unk=" << options.disable_unk << ", "
      << "size(suppress_sequences)=" << options.suppress_sequences.size() << ", "
-     << "prefix_bias_beta=" << options.prefix_bias_beta << ", "
-     << "end_token=\"" << options.end_token << "\", "
-     << "max_input_length=" << options.max_input_length << ", "
+     << "prefix_bias_beta=" << options.prefix_bias_beta << ", ";
+
+  if (std::holds_alternative<std::string>(options.end_token)) {
+    ss << "end_token=\"" << std::get<std::string>(options.end_token) << "\", ";
+  } else if (std::holds_alternative<std::vector<std::string>>(
+                 options.end_token)) {
+    for (auto &end_token :
+         std::get<std::vector<std::string>>(options.end_token)) {
+      ss << "end_token[]=" << end_token << " ";
+    }
+    ss << ",";
+  } else if (std::holds_alternative<std::vector<size_t>>(options.end_token)) {
+    for (auto &end_token :
+         std::get<std::vector<std::string>>(options.end_token)) {
+      ss << "end_token[]=" << end_token << " ";
+    }
+    ss << ",";
+  }
+
+  ss << "max_input_length=" << options.max_input_length << ", "
      << "max_decoding_length=" << options.max_decoding_length << ", "
      << "min_decoding_length=" << options.min_decoding_length << ", "
      << "sampling_topk=" << options.sampling_topk << ", "
