@@ -182,6 +182,10 @@ public:
         RETURN_IF_ERROR(ReadParameter(
             params, "beam_size", &(default_translation_options_.beam_size)));
       }
+      if (params.Find("repetition_penalty")) {
+        RETURN_IF_ERROR(ReadParameter(params, "repetition_penalty",
+                                      &(default_translation_options_.repetition_penalty)));
+      }
     }
     return nullptr;
   }
