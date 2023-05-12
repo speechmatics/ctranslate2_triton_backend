@@ -1,0 +1,51 @@
+backend: "ctranslate2"
+name: "facebook_m2m100_1.2B"
+max_batch_size: 64
+input [
+  {
+    name: "INPUT_IDS"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+    allow_ragged_batch: true
+  }
+]
+input [
+  {
+    name: "TARGET_PREFIX"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+    allow_ragged_batch: true
+  }
+]
+output [
+  {
+    name: "OUTPUT_IDS"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+  }
+]
+parameters [
+  {
+    key: "compute_type"
+    value {
+      string_value: "float16"
+    }
+  },
+  {
+    key: "max_decoding_length_multiple"
+    value {
+      string_value: "2"
+    }
+  },
+    {
+    key: "beam_size"
+    value {
+      string_value: "5"
+    }
+  }
+]
+
+instance_group [{ kind: KIND_GPU, count: 1 }]
+dynamic_batching {
+  max_queue_delay_microseconds: 5000
+}

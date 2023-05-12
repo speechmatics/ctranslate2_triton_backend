@@ -1,0 +1,43 @@
+backend: "ctranslate2"
+name: "Helsinki-NLP_opus-mt-en-de"
+max_batch_size: 128
+input [
+  {
+    name: "INPUT_IDS"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+    allow_ragged_batch: true
+  }
+]
+output [
+  {
+    name: "OUTPUT_IDS"
+    data_type: TYPE_INT32
+    dims: [ -1 ]
+  }
+]
+parameters [
+  {
+    key: "compute_type"
+    value {
+      string_value: "float16"
+    }
+  },
+  {
+    key: "max_decoding_length_multiple"
+    value {
+      string_value: "2"
+    }
+  },
+    {
+    key: "beam_size"
+    value {
+      string_value: "4"
+    }
+  }
+]
+
+instance_group [{ kind: KIND_GPU, count: 1 }]
+dynamic_batching {
+  max_queue_delay_microseconds: 5000
+}
